@@ -2616,6 +2616,22 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
+    // stingy: ngl--n_gpu_layers, ngls--n_gpu_layers_stingy
+    // stingy: A={0, 1, ..., -ngl-1} store/calc on cpu, B={-ngl, -ngl+1, ..., -ngls-1} store on cpu but calc on gpu, C={-ngls, ..., -1} store/calc on gpu
+    const int n_gpu_layers_stingy = this->n_gpu_layers_stingy_f();
+    const int n_B_start = std::max(int(hparams.n_layer) + 1 - n_gpu_layers, 0);
+    const int n_C_start = std::max(int(hparams.n_layer) + 1 - n_gpu_layers_stingy, 0);
+    // don't support multi-gpu now
+    GGML_ASSERT(!use_stingy() || devices.size() == 1);
+    auto * B_store_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    auto * B_calc_dev = B_store_dev;
+    if (use_stingy()) {
+        B_calc_dev = devices.at(0);
+    }
+    ggml_backend_buffer_type_t B_store_buft = ggml_backend_dev_buffer_type(B_store_dev);
+    ggml_backend_buffer_type_t B_calc_buft = ggml_backend_dev_buffer_type(B_calc_dev);
+    std::unordered_set<ggml_context *> B_store_ctxs;
+    ggml_context * B_calc_ctx;
 
     const bool use_mmap_buffer = true;
 
@@ -2671,7 +2687,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     const int i_gpu_start = std::max(int(hparams.n_layer) + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, int(n_layer) + 1);
-    auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
+    std::function<llama_model::impl::layer_dev(int)> get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < int(hparams.n_layer) && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
@@ -2682,6 +2698,19 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
+
+    // stingy: C to gpu
+    if (use_stingy()) {
+        get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
+            if (il < n_C_start) {
+                LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s\n", il, ggml_backend_dev_name(cpu_dev));
+                return {cpu_dev, &pimpl->cpu_buft_list};
+            }
+            auto * dev = B_calc_dev;
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s\n", il, ggml_backend_dev_name(dev));
+            return {dev, &pimpl->gpu_buft_list.at(dev)};
+        };
+    }
 
     // assign the input layer
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
@@ -7762,6 +7791,203 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 
+    // stingy: insert B slot
+    if (use_stingy()) {
+        // helper: llama-model-loader.cpp->create_tensor(+1045)
+        auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+            auto it = ml.ctx_map.find(buft);
+            if (it == ml.ctx_map.end()) {
+                // one ggml context per buffer type
+                int max_n_tensors = ml.n_tensors;
+                max_n_tensors += 1;                 // duplicated output tensor
+                max_n_tensors += hparams.n_layer*2; // duplicated rope freq tensors
+                if (true || ml.files.empty()) {
+                    max_n_tensors += hparams.n_layer*256; // this should be well above what any model actually uses
+                }
+                const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
+
+                ggml_init_params params = {
+                    /*.mem_size   =*/ ctx_size,
+                    /*.mem_buffer =*/ NULL,
+                    /*.no_alloc   =*/ true,
+                };
+
+                ggml_context * ctx = ggml_init(params);
+                if (!ctx) {
+                    throw std::runtime_error(format("failed to create ggml context"));
+                }
+
+                ml.ctx_map.emplace(buft, ctx);
+
+                return ctx;
+            }
+            return it->second.get();
+        };
+
+        B_calc_ctx = ctx_for_buft(B_calc_buft);
+        std::vector<ggml_tensor *> B;
+        for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+            ggml_context * ctx = ctx_ptr.get();
+
+            // skip contexts without tensors
+            if (ggml_get_first_tensor(ctx) == nullptr) {
+                continue;
+            }
+
+            for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                int bid = blk_id(t->name);
+                if (bid == n_B_start) {
+                    B_store_ctxs.insert(ctx);
+                    B.push_back(t);
+                }
+            }
+        }
+        // reserve for B tensor
+        for (ggml_tensor * t : B) {
+            ggml_tensor * new_tensor = ggml_dup_tensor(B_calc_ctx, t);
+            ggml_set_name(new_tensor, t->name);
+        }
+
+        // 在你的循环内部
+// for (auto * ctx : B_store_ctxs) {
+
+//     if (ggml_get_first_tensor(ctx) == nullptr) {
+//         continue;
+//     }
+
+//     // --- 调试打印开始 ---
+//     printf("\n--- Inspecting Context [%p] ---\n", (void*)ctx);
+//     printf("Used memory: %zu bytes\n", ggml_used_mem(ctx));
+    
+//     int count = 0;
+//     for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+//         count++;
+//         // 打印每个张量的简要信息
+//         printf("  [%d] Tensor: %s (%s)\n", count, t->name, ggml_type_name(t->type));
+//     }
+//     printf("Total tensors in this context: %d\n", count);
+//     // --- 调试打印结束 ---
+// }
+
+// {
+//     ggml_context * ctx = (ggml_context *) ctx_for_buft(B_calc_buft);
+    
+//     printf("\n--- [Deep Inspection] Context [%p] ---\n", (void*)ctx);
+//     printf("Used memory: %zu bytes\n", ggml_used_mem(ctx));
+    
+//     int count = 0;
+//     for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+//         count++;
+
+//         if (count >= 5) continue;
+        
+//         // 1. 基本信息与类型
+//         printf("  [%d] Tensor: %-20s | Type: %-8s | Op: %d\n", 
+//                count, t->name, ggml_type_name(t->type), (int)t->op);
+
+//         // 2. 形状 (ne) 与 步长 (nb)
+//         // GGML 维度顺序通常是 [width, height, depth, count]
+//         printf("       Shape (ne): [%ld, %ld, %ld, %ld]\n", 
+//                (long)t->ne[0], (long)t->ne[1], (long)t->ne[2], (long)t->ne[3]);
+        
+//         printf("       Stride(nb): [%zu, %zu, %zu, %zu]\n", 
+//                t->nb[0], t->nb[1], t->nb[2], t->nb[3]);
+
+//         // 3. 内存地址与数据源
+//         printf("       Data Addr : %p", t->data);
+//         if (t->view_src) {
+//             printf(" (View of: %s, Offset: %zu)", t->view_src->name, t->view_offs);
+//         }
+//         printf("\n");
+
+//         // 4. 源张量引用 (src)
+//         bool has_src = false;
+//         for (int i = 0; i < GGML_MAX_SRC; ++i) {
+//             if (t->src[i]) {
+//                 if (!has_src) { printf("       Sources   : "); has_src = true; }
+//                 printf("src[%d]=%s ", i, t->src[i]->name);
+//             }
+//         }
+//         if (has_src) printf("\n");
+
+//         printf("       -----------------------------------------------------\n");
+//     }
+//     printf("Total tensors in this context: %d\n", count);
+// }
+
+        struct ggml_context {
+size_t mem_size;
+void * mem_buffer;
+bool mem_buffer_owned;
+bool no_alloc;
+
+int n_objects;
+
+struct ggml_object * objects_begin;
+struct ggml_object * objects_end;
+};
+
+
+struct ggml_object {
+    size_t offs;
+    size_t size;
+
+    struct ggml_object * next;
+
+    enum ggml_object_type type;
+
+    char padding[4];
+};
+
+// ggml_context * ctx =(ggml_context *) ctx_for_buft(gpu_buft);
+//     // --- 打印 Context 核心元数据 ---
+//     printf("\n%s\n", ggml_backend_buft_name(gpu_buft));
+//     printf("\n[Context Debug: %p]\n", (void*)ctx);
+//     printf("  Memory Size:    %zu bytes (%.2f MB)\n", ctx->mem_size, ctx->mem_size / 1024.0 / 1024.0);
+//     printf("  Memory Buffer:  %p (%s)\n", ctx->mem_buffer, ctx->mem_buffer_owned ? "Owned" : "External");
+//     printf("  No Alloc:       %s\n", ctx->no_alloc ? "True" : "False");
+//     printf("  Object Count:   %d\n", ctx->n_objects);
+
+    // --- 调试打印结束 ---
+
+    //     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+    // ggml_context * ctx =( ggml_context *) ctx_ptr.get();
+
+    // if (ctx->objects_begin == nullptr) {
+    //     continue;
+    // }
+
+    // // --- 打印 Context 核心元数据 ---
+    // printf("\n%s\n", ggml_backend_buft_name(buft));
+    // printf("\n[Context Debug: %p]\n", (void*)ctx);
+    // printf("  Memory Size:    %zu bytes (%.2f MB)\n", ctx->mem_size, ctx->mem_size / 1024.0 / 1024.0);
+    // printf("  Memory Buffer:  %p (%s)\n", ctx->mem_buffer, ctx->mem_buffer_owned ? "Owned" : "External");
+    // printf("  No Alloc:       %s\n", ctx->no_alloc ? "True" : "False");
+    // printf("  Object Count:   %d\n", ctx->n_objects);
+
+    // --- 遍历内部对象链表 ---
+    // ggml_object 包含了张量元数据在内存池中的实际物理位置
+    // int obj_idx = 0;
+    // for (struct ggml_object * obj = (ggml_object *)ctx->objects_begin; obj != nullptr; obj = obj->next) {
+    //     // 计算该对象在 buffer 中的偏移量
+    //     size_t offset = (char*)obj->data - (char*)ctx->mem_buffer;
+        
+    //     printf("  - Obj[%d]: Type: %d | Offset: %zu | Size: %zu\n", 
+    //            obj_idx++, obj->type, offset, obj->size);
+
+    //     // 如果该对象是张量，可以打印更多信息
+    //     // 注意：obj->type == 0 通常代表 GGML_OBJECT_TENSOR
+    //     if (obj->type == 0) { 
+    //          struct ggml_tensor * t = (struct ggml_tensor *)obj->data;
+    //          printf("    -> Tensor Name: %s\n", t->name);
+    //     }
+
+    //     if (obj == ctx->objects_end) break;
+    // }
+
+    // std::__1::exit(1);
+}
+
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
@@ -7904,6 +8130,217 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // stingy: fix B_store_ctx name, join B_calc_ctx to ctx and tensors_by_name
+    if (use_stingy()) {
+        // fix SLOT name first
+        for (ggml_context * B_store_ctx : B_store_ctxs) {
+            for (struct ggml_tensor * t = ggml_get_first_tensor(B_store_ctx); t != nullptr; t = ggml_get_next_tensor(B_store_ctx, t)) {
+                int bid = blk_id(t->name);
+                if (bid == n_B_start) {
+                    std::string t_name(t->name);
+                    for (int i = 0; i < tensors_by_name.size(); i++) {
+                        std::string cur_name = tensors_by_name[i].first;
+                        struct ggml_tensor * cur_t = tensors_by_name[i].second;
+                        if (t_name != cur_name) {
+                            continue;
+                        }
+                        LLAMA_LOG_DEBUG("[STINGY] find store/calc slot: %s\n", cur_name.c_str());
+                        if (t != cur_t) {
+                            continue;
+                        }
+                        LLAMA_LOG_DEBUG("[STINGY] find store slot: %s\n", cur_name.c_str());
+                        // must be store SLOT, not the calc SLOT
+                        // fix store SLOT name
+                        std::string new_t_name = t_name + ".backup";
+                        ggml_set_name(t, new_t_name.c_str());
+                        tensors_by_name[i].first = new_t_name;
+                    }
+                }
+            }
+        }
+
+        // pass 1: get B store tensors, NOT INCLUDE SLOT
+        std::vector<ggml_tensor *> B_store_tensors;
+        for (ggml_context * B_store_ctx : B_store_ctxs) {
+            for (struct ggml_tensor * t = ggml_get_first_tensor(B_store_ctx); t != nullptr; t = ggml_get_next_tensor(B_store_ctx, t)) {
+                int bid = blk_id(t->name);
+                if (bid == n_B_start) {
+                    continue;
+                }
+                if (bid >= n_B_start && bid < n_C_start) {
+                    B_store_tensors.push_back(t);
+                }
+            }
+        }
+
+        // pass 2: join B calc tensors, NOT INCLUDE SLOT
+        for (int i = 0; i < B_store_tensors.size(); i++) {
+            ggml_tensor * store_tensor = B_store_tensors[i];
+            int bid = blk_id(store_tensor->name);
+            if (bid == n_B_start) {
+                continue;
+            }
+            if (bid < n_B_start || bid >= n_C_start) {
+                continue;
+            }
+            // create empty tensor
+            ggml_tensor * new_tensor = ggml_dup_tensor(B_calc_ctx, store_tensor);
+            // join new tensor meta
+            std::string slot_tensor_name = name_with_bid(store_tensor->name, n_B_start);
+            ggml_tensor * slot_tensor = nullptr;
+            for (int i = 0; i < tensors_by_name.size(); i++) {
+                std::string cur_name = tensors_by_name[i].first;
+                struct ggml_tensor * cur_t = tensors_by_name[i].second;
+                if (slot_tensor_name == cur_name) {
+                    slot_tensor = cur_t;
+                    break;
+                }
+            }
+            ggml_set_name(new_tensor, store_tensor->name);
+            share_mem(new_tensor, slot_tensor);
+            tensors_by_name.emplace_back(ggml_get_name(new_tensor), new_tensor);
+        }
+
+        // pass 3: fix B store name, NOT INCLUDE SLOT
+        for (ggml_context * B_store_ctx : B_store_ctxs) {
+            for (struct ggml_tensor * t = ggml_get_first_tensor(B_store_ctx); t != nullptr; t = ggml_get_next_tensor(B_store_ctx, t)) {
+                int bid = blk_id(t->name);
+                if (bid == n_B_start) {
+                    continue;
+                }
+                if (bid < n_B_start || bid >= n_C_start) {
+                    continue;
+                }
+                std::string t_name(t->name);
+                for (int i = 0; i < tensors_by_name.size(); i++) {
+                    std::string cur_name = tensors_by_name[i].first;
+                    struct ggml_tensor * cur_t = tensors_by_name[i].second;
+                    if (t_name != cur_name) {
+                        continue;
+                    }
+                    if (t != cur_t) {
+                        continue;
+                    }
+                    // must be store, not the calc
+                    // fix store name
+                    std::string new_t_name = t_name + ".backup";
+                    ggml_set_name(t, new_t_name.c_str());
+                    tensors_by_name[i].first = new_t_name;
+                }
+            }
+        }
+
+        // print all tensors by name to debug
+        // --- [STINGY DEBUG START] ---
+        LLAMA_LOG_INFO("\n--- Final Tensor Map Inspection (Stingy Mode) ---\n");
+        LLAMA_LOG_INFO("%-40s | %-10s | %-18s | %-18s\n", "Tensor Name", "Bid", "Data Addr", "Context");
+        LLAMA_LOG_INFO("------------------------------------------------------------------------------------------\n");
+
+        for (const auto & pair : tensors_by_name) {
+            const std::string & name = pair.first;
+            struct ggml_tensor * t  = pair.second;
+
+            if (!t) {
+                LLAMA_LOG_WARN("%-40s | %-10s | %-18s | %s\n", name.c_str(), "N/A", "NULL", "MISSING");
+                continue;
+            }
+
+            int bid = blk_id(t->name);
+            void * data_ptr = t->data;
+            
+            // 找出这个张量属于哪个 Context (简单通过指针范围或标记判断)
+            // 如果你有明确的 ctx 指针可以加入判断，这里示范基础打印
+            LLAMA_LOG_INFO("%-40s | %-10d | %p | %-18s\n", 
+                           name.c_str(), 
+                           bid, 
+                           data_ptr,
+                           (name.find(".backup") != std::string::npos) ? "B_store_ctx" : "B_calc_ctx");
+
+            // 特殊标记：如果当前张量的 data 指针和对应 Slot 的指针一致，说明 share_mem 成功
+            if (bid != n_B_start && name.find(".backup") == std::string::npos) {
+                 // 这里可以进一步逻辑校验，确认它是否真的共享了 n_B_start 的地址
+            }
+        }
+        LLAMA_LOG_INFO("------------------------------------------------------------------------------------------\n");
+        LLAMA_LOG_INFO("[STINGY] Debug dump complete. Forcing exit.\n");
+        // --- [STINGY DEBUG END] ---
+
+        // std::__1::exit(1);
+    }
+
+    // stingy: fix layers and model variebles
+    if (use_stingy()) {
+        rebind_B_tensors(n_B_start, n_C_start);
+    }
+
+    // stingy: fix dev_layers, B to gpu
+    if (use_stingy()) {
+        for (int il = n_B_start; il < n_C_start; ++il) {
+            pimpl->dev_layer[il] = {B_calc_dev, &pimpl->gpu_buft_list.at(B_calc_dev)};
+        }
+    }
+
+    // test stingy:
+    if (!use_stingy()) {
+        std::string t_name("blk.4.ffn_down.weight");
+        std::string t_rebind_name("blk.5.ffn_down.weight");
+        ggml_tensor * t_rebind = nullptr;
+        for (int i = 0; i < tensors_by_name.size(); i++) {
+            std::string cur_name = tensors_by_name[i].first;
+            if (cur_name == t_rebind_name) {
+                t_rebind = tensors_by_name[i].second;
+                break;
+            }
+        }
+        for (int i = 0; i < tensors_by_name.size(); i++) {
+            std::string cur_name = tensors_by_name[i].first;
+            if (cur_name == t_name) {
+                ggml_tensor * t = tensors_by_name[i].second;
+                t->data = t_rebind->data;
+                break;
+            }
+        }
+        {
+
+        // print all tensors by name to debug
+        // --- [STINGY DEBUG START] ---
+        LLAMA_LOG_INFO("\n--- Final Tensor Map Inspection (Stingy Mode) ---\n");
+        LLAMA_LOG_INFO("%-40s | %-10s | %-18s | %-18s\n", "Tensor Name", "Bid", "Data Addr", "Context");
+        LLAMA_LOG_INFO("------------------------------------------------------------------------------------------\n");
+
+        for (const auto & pair : tensors_by_name) {
+            const std::string & name = pair.first;
+            struct ggml_tensor * t  = pair.second;
+
+            if (!t) {
+                LLAMA_LOG_WARN("%-40s | %-10s | %-18s | %s\n", name.c_str(), "N/A", "NULL", "MISSING");
+                continue;
+            }
+
+            int bid = blk_id(t->name);
+            void * data_ptr = t->data;
+            
+            // 找出这个张量属于哪个 Context (简单通过指针范围或标记判断)
+            // 如果你有明确的 ctx 指针可以加入判断，这里示范基础打印
+            LLAMA_LOG_INFO("%-40s | %-10d | %p | %-18s\n", 
+                           name.c_str(), 
+                           bid, 
+                           data_ptr,
+                           (name.find(".backup") != std::string::npos) ? "B_store_ctx" : "B_calc_ctx");
+
+            // 特殊标记：如果当前张量的 data 指针和对应 Slot 的指针一致，说明 share_mem 成功
+            if (bid != n_B_start && name.find(".backup") == std::string::npos) {
+                 // 这里可以进一步逻辑校验，确认它是否真的共享了 n_B_start 的地址
+            }
+        }
+        LLAMA_LOG_INFO("------------------------------------------------------------------------------------------\n");
+        LLAMA_LOG_INFO("[STINGY] Debug dump complete. Forcing exit.\n");
+        // --- [STINGY DEBUG END] ---
+
+        // std::__1::exit(1);
+        }
+    }
+
     return true;
 }
 
@@ -7933,6 +8370,206 @@ size_t llama_model::n_devices() const {
 
 uint32_t llama_model::n_gpu_layers() const {
     return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer + 1;
+}
+
+// stingy: load fewer than need
+bool llama_model::use_stingy() {
+    int ngls = this->n_gpu_layers_stingy_f();
+    return ngls >= 0 && this->n_gpu_layers()-ngls >= 2; // stingy: no necessity when less than 2
+}
+
+// stingy: load fewer than need
+int llama_model::n_gpu_layers_stingy_f() {
+    if (this->n_gpu_layers_stingy == -2) {
+        // if invalid, load from env
+        const char * n_gpu_layers_stingy_raw = std::getenv("N_GPU_LAYERS_STINGY");
+        if (n_gpu_layers_stingy_raw != nullptr) {
+            this->n_gpu_layers_stingy = std::stoi(n_gpu_layers_stingy_raw);
+        } else {
+            this->n_gpu_layers_stingy = -1; // not set
+        }
+    }
+
+    return this->n_gpu_layers_stingy;
+}
+
+// stingy: load fewer than need
+void llama_model::rebind_B_tensors(int n_B_start, int n_C_start) {
+    LLAMA_LOG_INFO("[STINGY] Starting comprehensive rebinding of model tensors...\n");
+
+    // 1. 构建活动张量（计算槽位）的快速查找表
+    std::unordered_map<std::string, ggml_tensor *> active_tensors;
+    for (const auto & pair : tensors_by_name) {
+        // 只收录不带 .backup 后缀的张量，这些是 share_mem 后的新计算张量
+        if (!is_backup(pair.first.c_str())) {
+            active_tensors[pair.first] = pair.second;
+        }
+    }
+
+    // 2. 定义重绑定核心逻辑
+    auto rebind = [&](ggml_tensor * & t) {
+        if (t == nullptr) return;
+        
+        // 如果当前指针指向的是一个标记为 .backup 的张量，则需要替换
+        if (is_backup(t->name)) {
+            std::string name_str(t->name);
+            size_t pos = name_str.find(".backup");
+            if (pos != std::string::npos) {
+                std::string original_name = name_str.substr(0, pos);
+                if (active_tensors.count(original_name)) {
+                    ggml_tensor * new_t = active_tensors[original_name];
+                    // LLAMA_LOG_DEBUG("[STINGY] Rebinding %s -> %s\n", t->name, new_t->name);
+                    t = new_t;
+                }
+            }
+        }
+    };
+
+    // 3. 重绑定模型全局张量 (llama_model 成员)
+    rebind(tok_embd);
+    rebind(type_embd);
+    rebind(pos_embd);
+    rebind(tok_norm);
+    rebind(tok_norm_b);
+    rebind(output_norm);
+    rebind(output_norm_b);
+    rebind(output);
+    rebind(output_b);
+    rebind(output_norm_enc);
+    rebind(cls);
+    rebind(cls_b);
+    rebind(cls_out);
+    rebind(cls_out_b);
+    rebind(cls_norm);
+    rebind(conv1d);
+    rebind(conv1d_b);
+    rebind(tok_embd_per_layer);
+    rebind(altup_proj);
+    rebind(altup_unembd_proj);
+    rebind(per_layer_model_proj);
+    rebind(per_layer_proj_norm);
+    rebind(dense_2_out_layers);
+    rebind(dense_2_out_layers_b);
+    rebind(dense_3_out_layers);
+
+    // 4. 遍历并重绑定每一层的张量 (llama_layer 成员)
+    for (size_t i = 0; i < layers.size(); ++i) {
+        if (i < n_B_start || i >= n_C_start) {
+            continue;
+        }
+        auto & l = layers[i];
+
+        // Normalization
+        rebind(l.attn_norm);       rebind(l.attn_norm_b);
+        rebind(l.attn_norm_2);     rebind(l.attn_norm_2_b);
+        rebind(l.attn_q_norm);      rebind(l.attn_q_norm_b);
+        rebind(l.attn_k_norm);      rebind(l.attn_k_norm_b);
+        rebind(l.attn_out_norm);    rebind(l.attn_out_norm_b);
+        rebind(l.attn_q_a_norm);    rebind(l.attn_kv_a_norm);
+        rebind(l.attn_sub_norm);    rebind(l.attn_post_norm);
+        rebind(l.ffn_sub_norm);     rebind(l.attn_norm_cross);
+        rebind(l.attn_norm_enc);    rebind(l.ssm_norm);
+        rebind(l.ssm_dt_norm);      rebind(l.ssm_b_norm);
+        rebind(l.ssm_c_norm);
+
+        // Attention weights
+        rebind(l.wq); rebind(l.wk); rebind(l.wv); rebind(l.wo);
+        rebind(l.wqkv); rebind(l.wq_a); rebind(l.wq_b);
+        rebind(l.wkv_a_mqa); rebind(l.wkv_b); rebind(l.wk_b); rebind(l.wv_b);
+        rebind(l.wq_cross); rebind(l.wk_cross); rebind(l.wv_cross); rebind(l.wo_cross);
+        rebind(l.wq_enc); rebind(l.wk_enc); rebind(l.wv_enc); rebind(l.wo_enc);
+        rebind(l.wqkv_gate);
+
+        // Attention bias & rel pos
+        rebind(l.bq); rebind(l.bk); rebind(l.bv); rebind(l.bo); rebind(l.bqkv);
+        rebind(l.attn_rel_b); rebind(l.attn_rel_b_enc); rebind(l.attn_rel_b_cross);
+
+        // FFN
+        rebind(l.ffn_norm); rebind(l.ffn_norm_b); rebind(l.ffn_post_norm);
+        rebind(l.ffn_gate); rebind(l.ffn_down); rebind(l.ffn_up);
+        rebind(l.ffn_gate_enc); rebind(l.ffn_down_enc); rebind(l.ffn_up_enc);
+        
+        // MoE
+        rebind(l.ffn_gate_inp); rebind(l.ffn_gate_inp_s);
+        rebind(l.ffn_gate_exps); rebind(l.ffn_down_exps); rebind(l.ffn_up_exps);
+        rebind(l.ffn_gate_up_exps); rebind(l.ffn_gate_inp_b);
+        rebind(l.ffn_gate_exps_b); rebind(l.ffn_down_exps_b);
+        rebind(l.ffn_up_exps_b); rebind(l.ffn_gate_up_exps_b);
+        rebind(l.ffn_gate_exps_s); rebind(l.ffn_down_exps_s); rebind(l.ffn_up_exps_s);
+
+        // Mamba / SSM
+        rebind(l.ssm_in); rebind(l.ssm_x); rebind(l.ssm_dt); rebind(l.ssm_out);
+        rebind(l.ssm_conv1d); rebind(l.ssm_a); rebind(l.ssm_d);
+        rebind(l.ssm_conv1d_b); rebind(l.ssm_dt_b);
+        rebind(l.ssm_beta_alpha); rebind(l.ssm_alpha);
+
+        // BitNet / Scales
+        rebind(l.wq_s); rebind(l.wk_s); rebind(l.wv_s); rebind(l.wo_s);
+        rebind(l.wqkv_s); rebind(l.ffn_gate_s); rebind(l.ffn_up_s); rebind(l.ffn_down_s);
+
+        // 额外子结构 (PosNet, ConvNext, etc.)
+        rebind(l.posnet.norm1); rebind(l.posnet.conv1); rebind(l.posnet.norm2); rebind(l.posnet.conv2);
+        rebind(l.posnet.attn_q); rebind(l.posnet.attn_k); rebind(l.posnet.attn_v); rebind(l.posnet.attn_o);
+        
+        rebind(l.convnext.dw); rebind(l.convnext.norm); rebind(l.convnext.pw1); rebind(l.convnext.pw2);
+        
+        rebind(l.shortconv.in_proj); rebind(l.shortconv.conv); rebind(l.shortconv.out_proj);
+    }
+
+    LLAMA_LOG_INFO("[STINGY] All pointers successfully rebound to active compute slots.\n");
+}
+
+// stingy: load fewer than need
+int blk_id(const char * tensor_name) {
+    int ret = -1;
+    if (strncmp(tensor_name, "blk.", 4) != 0 || sscanf(tensor_name + 4, "%d", &ret) != 1) {
+        return -1;
+    }
+    return ret;
+}
+
+// stingy: load fewer than need
+std::string name_with_bid(const char * tensor_name, int bid) {
+    char buf[GGML_MAX_NAME];
+    
+    int layer_idx = 0;
+    char suffix[GGML_MAX_NAME];
+    
+    if (sscanf(tensor_name, "blk.%d.%s", &layer_idx, suffix) == 2) {
+        snprintf(buf, sizeof(buf), "blk.%d.%s", bid, suffix);
+        return std::string(buf);
+    }
+    
+    return std::string(tensor_name);
+}
+
+// stingy: load fewer than need
+void share_mem(ggml_tensor * t, const ggml_tensor * src) {
+    t->buffer = src->buffer;
+
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        t->nb[i] = src->nb[i];
+    }
+
+    t->flags = src->flags;
+
+    t->data = src->data;
+    t->extra = src->extra;
+    strcpy(t->padding, src->padding);
+}
+
+// stingy: load fewer than need
+bool is_backup(const char* tensor_name) {
+    if (tensor_name == nullptr) return false;
+
+    size_t len = std::strlen(tensor_name);
+    const char* suffix = ".backup";
+    size_t suffix_len = std::strlen(suffix);
+
+    if (len >= suffix_len) {
+        return std::strcmp(tensor_name + len - suffix_len, suffix) == 0;
+    }
+    return false;
 }
 
 llama_split_mode llama_model::split_mode() const {

@@ -27,7 +27,6 @@
 #include <sys/sysctl.h>
 #endif
 
-
 // backend buffer type
 
 const char * ggml_backend_buft_name(ggml_backend_buffer_type_t buft) {
@@ -742,6 +741,22 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+/*******************************************************************************/
+/****************************** CHANGE BEGIN ***********************************/
+int is_backend_vid(int * tensor_backend_id) {
+    return *tensor_backend_id <= -2;
+}
+
+int tensor_backend_vid_to_id(int * tensor_backend_id) {
+    if (!is_backend_vid(tensor_backend_id)) {
+        return *tensor_backend_id;
+    }
+    // vdev -2 <--> dev 0, vdev -3 <--> vdev 1, vdev -4 <--> vdev 2
+    return -2 - *tensor_backend_id;
+}
+/****************************** CHANGE END *************************************/
+/*******************************************************************************/
+
 
 // returns the priority of the backend, lower id is higher priority
 static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
@@ -945,6 +960,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
         int * leaf_backend_id = &tensor_backend_id(leaf);
+        GGML_LOG_DEBUG("[IMPORTANT] leaf: %s, leaf_backend[PRESET]: %d\n", leaf->name, *leaf_backend_id);
         // do not overwrite user assignments
         if (*leaf_backend_id == -1) {
             *leaf_backend_id = ggml_backend_sched_backend_id_from_cur(sched, leaf);
@@ -1438,7 +1454,6 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             return false;
         }
     }
-
     return true;
 }
 
