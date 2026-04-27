@@ -937,7 +937,6 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // stingy: load fewer than need
-#include "../../stingy/stingy-data.cpp"
 #include "../../stingy/stingy.cpp"
 #include <unordered_map>
 

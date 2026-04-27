@@ -1,7 +1,16 @@
 #include "ggml.h"
-#include "stingy-data.h"
 
 #include <vector>
+#include <string>
+
+int s_use_stingy;
+int s_nl;
+int s_ngl;
+int s_ngls;
+int s_n_B_start;
+int s_n_C_start;
+
+std::vector<std::pair<std::string, struct ggml_tensor *>> * s_tensors_by_name;
 
 void init_stingy(int nl, int ngl) {
     s_nl = nl;
@@ -110,9 +119,64 @@ void print_stingy_data() {
         printf("Zone B (CPU->GPU): [%d, %d)\n", s_n_B_start, s_n_C_start);
         printf("Zone C (GPU):      [%d, %d]\n", s_n_C_start, s_nl);
         
-        if (s_tensors_by_name != nullptr) {
-            printf("Tracked Tensors: %zu\n", s_tensors_by_name->size());
-        }
     }
     printf("----------------------------------------------\n\n");
+}
+
+// Getter and Setter functions for global variables
+
+int get_s_use_stingy() {
+    return s_use_stingy;
+}
+
+void set_s_use_stingy(int value) {
+    s_use_stingy = value;
+}
+
+int get_s_nl() {
+    return s_nl;
+}
+
+void set_s_nl(int value) {
+    s_nl = value;
+}
+
+int get_s_ngl() {
+    return s_ngl;
+}
+
+void set_s_ngl(int value) {
+    s_ngl = value;
+}
+
+int get_s_ngls() {
+    return s_ngls;
+}
+
+void set_s_ngls(int value) {
+    s_ngls = value;
+}
+
+int get_s_n_B_start() {
+    return s_n_B_start;
+}
+
+void set_s_n_B_start(int value) {
+    s_n_B_start = value;
+}
+
+int get_s_n_C_start() {
+    return s_n_C_start;
+}
+
+void set_s_n_C_start(int value) {
+    s_n_C_start = value;
+}
+
+const void* get_s_tensors_by_name() {
+    return s_tensors_by_name;
+}
+
+void set_s_tensors_by_name(void * value) {
+    s_tensors_by_name = (std::vector<std::pair<std::string, struct ggml_tensor *>> *)value;
 }

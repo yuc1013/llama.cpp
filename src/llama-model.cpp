@@ -29,7 +29,7 @@
 #include <stdexcept>
 
 // stingy: load fewer than need
-#include "../stingy/stingy.cpp"
+#include "../stingy/stingy.h"
 
 const char * llm_type_name(llm_type type) {
     switch (type) {
@@ -2621,8 +2621,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const int n_gpu_layers = this->n_gpu_layers();
     // stingy: don't support multi-gpu now
     init_stingy(n_layer, n_gpu_layers);
-    const int n_B_start = s_n_B_start;
-    const int n_C_start = s_n_C_start;
+    const int n_B_start = get_s_n_B_start();
+    const int n_C_start = get_s_n_C_start();
     GGML_ASSERT(!use_stingy() || devices.size() == 1);
     auto * B_store_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     auto * B_calc_dev = B_store_dev;
@@ -8293,7 +8293,7 @@ struct ggml_object {
     // stingy: init tensors_by_name
     if (use_stingy()) {
         print_stingy_data();
-        s_tensors_by_name = &this->tensors_by_name;
+        set_s_tensors_by_name(&this->tensors_by_name);
     }
 
     return true;
