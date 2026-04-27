@@ -29,7 +29,7 @@
 #include <stdexcept>
 
 // stingy: load fewer than need
-#include "../stingy/stingy.h"
+#include "stingy.h"
 
 const char * llm_type_name(llm_type type) {
     switch (type) {

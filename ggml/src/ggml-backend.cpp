@@ -937,8 +937,17 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // stingy: load fewer than need
-#include "../../stingy/stingy.cpp"
+#include "stingy.h"
 #include <unordered_map>
+
+extern int s_use_stingy;
+extern int s_nl;
+extern int s_ngl;
+extern int s_ngls;
+extern int s_n_B_start;
+extern int s_n_C_start;
+
+extern std::vector<std::pair<std::string, struct ggml_tensor *>> * s_tensors_by_name;
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
