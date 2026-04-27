@@ -2,15 +2,16 @@
 #define STINGY_H
 
 #include "ggml.h"
-#include <vector>
-#include <string>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 // Function declarations
 
 void init_stingy(int nl, int ngl);
 bool use_stingy();
 int blk_id(const char * tensor_name);
-std::string name_with_bid(const char * tensor_name, int bid);
 void share_mem(ggml_tensor * t, const ggml_tensor * src);
 bool is_backup(const char* tensor_name);
 void print_stingy_data();
@@ -30,5 +31,9 @@ int get_s_n_C_start();
 void set_s_n_C_start(int value);
 const void * get_s_tensors_by_name();
 void set_s_tensors_by_name(void* value);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // STINGY_H

@@ -31,6 +31,21 @@
 // stingy: load fewer than need
 #include "stingy.h"
 
+// stingy: load fewer than need
+std::string name_with_bid(const char * tensor_name, int bid) {
+    char buf[GGML_MAX_NAME];
+    
+    int layer_idx = 0;
+    char suffix[GGML_MAX_NAME];
+    
+    if (sscanf(tensor_name, "blk.%d.%s", &layer_idx, suffix) == 2) {
+        snprintf(buf, sizeof(buf), "blk.%d.%s", bid, suffix);
+        return std::string(buf);
+    }
+    
+    return std::string(tensor_name);
+}
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";

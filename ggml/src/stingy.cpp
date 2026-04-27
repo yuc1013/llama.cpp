@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "stingy.h"
 
 #include <vector>
 #include <string>
