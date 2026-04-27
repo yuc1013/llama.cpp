@@ -583,9 +583,6 @@ struct llama_model {
     size_t n_devices() const;
 
     uint32_t n_gpu_layers() const;
-    int n_gpu_layers_stingy = -2; // stingy: -2 invalid, -1 not set
-    bool use_stingy(); // stingy: load fewer than need
-    int n_gpu_layers_stingy_f(); // stingy: load fewer than need
     void rebind_B_tensors(int n_B_start, int n_C_start); // stingy: load fewer than need
     llama_split_mode split_mode() const;
 
@@ -628,9 +625,3 @@ const char * llm_type_name(llm_type type);
 // For internal test use
 // TODO: remove
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
-
-// stingy: load fewer than need
-int blk_id(const char * tensor_name);
-std::string name_with_bid(const char * tensor_name, int bid);
-void share_mem(ggml_tensor * t, const ggml_tensor * src);
-bool is_backup(const char* tensor_name);

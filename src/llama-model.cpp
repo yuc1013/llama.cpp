@@ -28,6 +28,9 @@
 #include <sstream>
 #include <stdexcept>
 
+// stingy: load fewer than need
+#include "../stingy/stingy.cpp"
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";
@@ -2616,12 +2619,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
-    // stingy: ngl--n_gpu_layers, ngls--n_gpu_layers_stingy
-    // stingy: A={0, 1, ..., -ngl-1} store/calc on cpu, B={-ngl, -ngl+1, ..., -ngls-1} store on cpu but calc on gpu, C={-ngls, ..., -1} store/calc on gpu
-    const int n_gpu_layers_stingy = this->n_gpu_layers_stingy_f();
-    const int n_B_start = std::max(int(hparams.n_layer) + 1 - n_gpu_layers, 0);
-    const int n_C_start = std::max(int(hparams.n_layer) + 1 - n_gpu_layers_stingy, 0);
-    // don't support multi-gpu now
+    // stingy: don't support multi-gpu now
+    init_stingy(n_layer, n_gpu_layers);
+    const int n_B_start = s_n_B_start;
+    const int n_C_start = s_n_C_start;
     GGML_ASSERT(!use_stingy() || devices.size() == 1);
     auto * B_store_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     auto * B_calc_dev = B_store_dev;
@@ -8098,6 +8099,13 @@ struct ggml_object {
         LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
     }
 
+
+
+    if (use_stingy()) {
+        LLAMA_LOG_DEBUG("FVFV1088\n");
+    }
+
+
     // print memory requirements per buffer type
     for (auto & [_, bufs] : pimpl->ctxs_bufs) {
         for (auto & buf: bufs) {
@@ -8280,65 +8288,12 @@ struct ggml_object {
         }
     }
 
-    // test stingy:
-    if (!use_stingy()) {
-        std::string t_name("blk.4.ffn_down.weight");
-        std::string t_rebind_name("blk.5.ffn_down.weight");
-        ggml_tensor * t_rebind = nullptr;
-        for (int i = 0; i < tensors_by_name.size(); i++) {
-            std::string cur_name = tensors_by_name[i].first;
-            if (cur_name == t_rebind_name) {
-                t_rebind = tensors_by_name[i].second;
-                break;
-            }
-        }
-        for (int i = 0; i < tensors_by_name.size(); i++) {
-            std::string cur_name = tensors_by_name[i].first;
-            if (cur_name == t_name) {
-                ggml_tensor * t = tensors_by_name[i].second;
-                t->data = t_rebind->data;
-                break;
-            }
-        }
-        {
 
-        // print all tensors by name to debug
-        // --- [STINGY DEBUG START] ---
-        LLAMA_LOG_INFO("\n--- Final Tensor Map Inspection (Stingy Mode) ---\n");
-        LLAMA_LOG_INFO("%-40s | %-10s | %-18s | %-18s\n", "Tensor Name", "Bid", "Data Addr", "Context");
-        LLAMA_LOG_INFO("------------------------------------------------------------------------------------------\n");
 
-        for (const auto & pair : tensors_by_name) {
-            const std::string & name = pair.first;
-            struct ggml_tensor * t  = pair.second;
-
-            if (!t) {
-                LLAMA_LOG_WARN("%-40s | %-10s | %-18s | %s\n", name.c_str(), "N/A", "NULL", "MISSING");
-                continue;
-            }
-
-            int bid = blk_id(t->name);
-            void * data_ptr = t->data;
-            
-            // 找出这个张量属于哪个 Context (简单通过指针范围或标记判断)
-            // 如果你有明确的 ctx 指针可以加入判断，这里示范基础打印
-            LLAMA_LOG_INFO("%-40s | %-10d | %p | %-18s\n", 
-                           name.c_str(), 
-                           bid, 
-                           data_ptr,
-                           (name.find(".backup") != std::string::npos) ? "B_store_ctx" : "B_calc_ctx");
-
-            // 特殊标记：如果当前张量的 data 指针和对应 Slot 的指针一致，说明 share_mem 成功
-            if (bid != n_B_start && name.find(".backup") == std::string::npos) {
-                 // 这里可以进一步逻辑校验，确认它是否真的共享了 n_B_start 的地址
-            }
-        }
-        LLAMA_LOG_INFO("------------------------------------------------------------------------------------------\n");
-        LLAMA_LOG_INFO("[STINGY] Debug dump complete. Forcing exit.\n");
-        // --- [STINGY DEBUG END] ---
-
-        // std::__1::exit(1);
-        }
+    // stingy: init tensors_by_name
+    if (use_stingy()) {
+        print_stingy_data();
+        s_tensors_by_name = &this->tensors_by_name;
     }
 
     return true;
@@ -8370,27 +8325,6 @@ size_t llama_model::n_devices() const {
 
 uint32_t llama_model::n_gpu_layers() const {
     return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer + 1;
-}
-
-// stingy: load fewer than need
-bool llama_model::use_stingy() {
-    int ngls = this->n_gpu_layers_stingy_f();
-    return ngls >= 0 && this->n_gpu_layers()-ngls >= 2; // stingy: no necessity when less than 2
-}
-
-// stingy: load fewer than need
-int llama_model::n_gpu_layers_stingy_f() {
-    if (this->n_gpu_layers_stingy == -2) {
-        // if invalid, load from env
-        const char * n_gpu_layers_stingy_raw = std::getenv("N_GPU_LAYERS_STINGY");
-        if (n_gpu_layers_stingy_raw != nullptr) {
-            this->n_gpu_layers_stingy = std::stoi(n_gpu_layers_stingy_raw);
-        } else {
-            this->n_gpu_layers_stingy = -1; // not set
-        }
-    }
-
-    return this->n_gpu_layers_stingy;
 }
 
 // stingy: load fewer than need
@@ -8517,59 +8451,6 @@ void llama_model::rebind_B_tensors(int n_B_start, int n_C_start) {
     }
 
     LLAMA_LOG_INFO("[STINGY] All pointers successfully rebound to active compute slots.\n");
-}
-
-// stingy: load fewer than need
-int blk_id(const char * tensor_name) {
-    int ret = -1;
-    if (strncmp(tensor_name, "blk.", 4) != 0 || sscanf(tensor_name + 4, "%d", &ret) != 1) {
-        return -1;
-    }
-    return ret;
-}
-
-// stingy: load fewer than need
-std::string name_with_bid(const char * tensor_name, int bid) {
-    char buf[GGML_MAX_NAME];
-    
-    int layer_idx = 0;
-    char suffix[GGML_MAX_NAME];
-    
-    if (sscanf(tensor_name, "blk.%d.%s", &layer_idx, suffix) == 2) {
-        snprintf(buf, sizeof(buf), "blk.%d.%s", bid, suffix);
-        return std::string(buf);
-    }
-    
-    return std::string(tensor_name);
-}
-
-// stingy: load fewer than need
-void share_mem(ggml_tensor * t, const ggml_tensor * src) {
-    t->buffer = src->buffer;
-
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        t->nb[i] = src->nb[i];
-    }
-
-    t->flags = src->flags;
-
-    t->data = src->data;
-    t->extra = src->extra;
-    strcpy(t->padding, src->padding);
-}
-
-// stingy: load fewer than need
-bool is_backup(const char* tensor_name) {
-    if (tensor_name == nullptr) return false;
-
-    size_t len = std::strlen(tensor_name);
-    const char* suffix = ".backup";
-    size_t suffix_len = std::strlen(suffix);
-
-    if (len >= suffix_len) {
-        return std::strcmp(tensor_name + len - suffix_len, suffix) == 0;
-    }
-    return false;
 }
 
 llama_split_mode llama_model::split_mode() const {

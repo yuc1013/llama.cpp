@@ -790,7 +790,7 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
     return -1;
 }
 
-#if 0
+#if 1
 #define GGML_SCHED_MAX_SPLITS_DEBUG 4096
 static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML_SCHED_MAX_SPLIT_INPUTS][128]; // debug only
 #define SET_CAUSE(node, ...) sprintf(causes[hash_id(node)], __VA_ARGS__)
@@ -936,6 +936,11 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
+// stingy: load fewer than need
+#include "../../stingy/stingy-data.cpp"
+#include "../../stingy/stingy.cpp"
+#include <unordered_map>
+
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
@@ -960,7 +965,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
         int * leaf_backend_id = &tensor_backend_id(leaf);
-        GGML_LOG_DEBUG("[IMPORTANT] leaf: %s, leaf_backend[PRESET]: %d\n", leaf->name, *leaf_backend_id);
         // do not overwrite user assignments
         if (*leaf_backend_id == -1) {
             *leaf_backend_id = ggml_backend_sched_backend_id_from_cur(sched, leaf);
@@ -1316,6 +1320,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     int graph_size = std::max(graph->n_nodes, graph->n_leafs) + sched->n_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sched->n_copies;
+    
+    // stingy: load fewer than need
+    if (use_stingy() && s_tensors_by_name != nullptr) {
+        graph_size += s_nl * 256;
+    }
 
     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
     sched->debug_prev_graph_size = sched->debug_graph_size;
@@ -1403,6 +1412,110 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->leaf_backend_ids[graph_copy->n_leafs] = tensor_backend_id(leaf);
         assert(graph_copy->size > graph_copy->n_leafs);
         graph_copy->leafs[graph_copy->n_leafs++] = leaf;
+    }
+
+    // stingy: fix leafs, modify B on gpu to CPY
+    // note: leaf dep backend, tensor_copy_id
+    if (use_stingy() && s_tensors_by_name != nullptr) {
+        // 1. 预先确定 CPU 后端的 ID
+        // 在 llama.cpp 中，通常第一个 backend 或者名称为 "CPU" 的是目标
+        int cpu_backend_id = -1;
+        for (int b = 0; b < sched->n_backends; ++b) {
+            if (strcmp(ggml_backend_name(sched->backends[b]), "CPU") == 0) {
+                cpu_backend_id = b;
+                break;
+            }
+        }
+
+        // 1. 创建哈希表，用于记录需要被替换的映射关系：原 leaf -> 新的 cpy_node
+        std::unordered_map<struct ggml_tensor *, struct ggml_tensor *> leaf_to_cpy;
+
+        const int n_leafs_org = graph_copy->n_leafs;
+        for (int i = 0; i < n_leafs_org; i++) {
+            struct ggml_tensor * leaf = graph_copy->leafs[i];
+            int bid = blk_id(leaf->name);
+
+            // 判定是否属于 Stingy Loading 命中区间
+            if (bid >= s_n_B_start && bid < s_n_C_start && !is_backup(leaf->name)) {
+                
+                // 1. 寻找 Backup 张量 (通常在 CPU 上)
+                struct ggml_tensor * backup_tensor = nullptr;
+                std::string backup_name = std::string(leaf->name) + ".backup";
+                
+                for (const auto & pair : *s_tensors_by_name) {
+                    if (pair.first == backup_name) {
+                        backup_tensor = pair.second;
+                        break;
+                    }
+                }
+
+                if (backup_tensor) {
+                    GGML_LOG_DEBUG("STINGY [Block %2d]: Redirecting %-25s | CPU_ID: %d -> GPU_ID: %d\n", 
+                    bid, leaf->name, cpu_backend_id, tensor_backend_id(leaf));
+                    assert(graph_copy->n_leafs + 1 < graph_copy->size);
+                    
+                    // register
+                    tensor_backend_id(backup_tensor) = cpu_backend_id;
+                    
+                    int backup_backend_id = tensor_backend_id(backup_tensor);
+                    sched->leaf_backend_ids[graph_copy->n_leafs] = backup_backend_id;
+                    graph_copy->leafs[graph_copy->n_leafs++] = backup_tensor;
+                    GGML_ASSERT(backup_backend_id <= 4 && backup_backend_id >= 0);
+
+                    size_t orig_id = hash_id(leaf);
+                    int target_backend_id = tensor_backend_id(leaf); // 通常是 GPU
+
+                    // 4. 显式插入 CPY 节点：从 Backup (CPU) -> Leaf (GPU)
+                    assert(graph_copy->n_nodes + 1 < graph_copy->size);
+                    
+                    // 创建一个显式的拷贝操作
+                    struct ggml_tensor * cpy_node = ggml_cpy(sched->ctx, backup_tensor, leaf);
+                    tensor_id_copy(orig_id, target_backend_id, sched->cur_copy) = cpy_node;
+                    
+                    // 3. 关键改进：记录映射关系，而不是立即遍历
+                    leaf_to_cpy[leaf] = cpy_node;
+
+                    // CPY 动作发生在目标后端（GPU）
+                    sched->node_backend_ids[graph_copy->n_nodes] = target_backend_id;
+                    graph_copy->nodes[graph_copy->n_nodes++] = cpy_node;
+                    
+                    // 标记 CPY 节点的原因，方便调试
+                    SET_CAUSE(cpy_node, "stingy_cpy");
+                }
+            }
+        }
+
+        // 4. 最后只需遍历一次计算图，完成所有引用的统一替换
+        if (!leaf_to_cpy.empty()) {
+            int total_replacements = 0;
+            GGML_LOG_DEBUG("STINGY: Starting reference replacement for %zu tracked tensors...\n", leaf_to_cpy.size());
+
+            for (int i = 0; i < graph_copy->n_nodes; i++) {
+                struct ggml_tensor * node = graph_copy->nodes[i];
+                
+                // 跳过 CPY 节点本身，防止逻辑闭环
+                if (node->op == GGML_OP_CPY) {
+                    continue;
+                }
+
+                for (int k = 0; k < GGML_MAX_SRC; k++) {
+                    if (node->src[k] == nullptr) break;
+
+                    // 检查该输入是否在我们的替换名单中
+                    auto it = leaf_to_cpy.find(node->src[k]);
+                    if (it != leaf_to_cpy.end()) {
+                        // 记录详细的替换日志
+                        GGML_LOG_DEBUG("STINGY: [Node %4d: %-15s] Replacing src[%d]: %-25s -> %-25s\n", 
+                            i, ggml_op_name(node->op), k, it->first->name, it->second->name);
+                        
+                        node->src[k] = it->second;
+                        total_replacements++;
+                    }
+                }
+            }
+            
+            GGML_LOG_DEBUG("STINGY: Reference replacement finished. Total updates: %d\n", total_replacements);
+        }
     }
 }
 
