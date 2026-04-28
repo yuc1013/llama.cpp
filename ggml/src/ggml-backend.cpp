@@ -947,6 +947,7 @@ extern int s_ngls;
 extern int s_n_B_start;
 extern int s_n_C_start;
 
+#include <string>
 extern std::vector<std::pair<std::string, struct ggml_tensor *>> * s_tensors_by_name;
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
