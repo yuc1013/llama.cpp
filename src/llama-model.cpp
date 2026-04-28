@@ -7808,7 +7808,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     ml.done_getting_tensors();
 
     // stingy: insert B slot
-    if (use_stingy()) {
+    if (false && use_stingy()) {
         // helper: llama-model-loader.cpp->create_tensor(+1045)
         auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
             auto it = ml.ctx_map.find(buft);
@@ -8114,13 +8114,6 @@ struct ggml_object {
         LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
     }
 
-
-
-    if (use_stingy()) {
-        LLAMA_LOG_DEBUG("FVFV1088\n");
-    }
-
-
     // print memory requirements per buffer type
     for (auto & [_, bufs] : pimpl->ctxs_bufs) {
         for (auto & buf: bufs) {
@@ -8134,6 +8127,20 @@ struct ggml_object {
         for (auto * cur = ggml_get_first_tensor(ctx.get()); cur != NULL; cur = ggml_get_next_tensor(ctx.get(), cur)) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
+    }
+
+    // stingy: fix dev_layers, B to gpu
+    if (use_stingy()) {
+        for (int il = n_B_start; il < n_C_start; ++il) {
+            pimpl->dev_layer[il] = {B_calc_dev, &pimpl->gpu_buft_list.at(B_calc_dev)};
+            LLAMA_LOG_DEBUG("[STINGY] Layer %d assigned to buffers: ", il);
+        }
+    }
+
+    // stingy: init tensors_by_name
+    if (use_stingy()) {
+        print_stingy_data();
+        set_s_tensors_by_name(&this->tensors_by_name);
     }
 
     if (ml.no_alloc) {
@@ -8154,7 +8161,7 @@ struct ggml_object {
     }
 
     // stingy: fix B_store_ctx name, join B_calc_ctx to ctx and tensors_by_name
-    if (use_stingy()) {
+    if (false && use_stingy()) {
         // fix SLOT name first
         for (ggml_context * B_store_ctx : B_store_ctxs) {
             for (struct ggml_tensor * t = ggml_get_first_tensor(B_store_ctx); t != nullptr; t = ggml_get_next_tensor(B_store_ctx, t)) {
@@ -8292,23 +8299,8 @@ struct ggml_object {
     }
 
     // stingy: fix layers and model variebles
-    if (use_stingy()) {
+    if (false && use_stingy()) {
         rebind_B_tensors(n_B_start, n_C_start);
-    }
-
-    // stingy: fix dev_layers, B to gpu
-    if (use_stingy()) {
-        for (int il = n_B_start; il < n_C_start; ++il) {
-            pimpl->dev_layer[il] = {B_calc_dev, &pimpl->gpu_buft_list.at(B_calc_dev)};
-        }
-    }
-
-
-
-    // stingy: init tensors_by_name
-    if (use_stingy()) {
-        print_stingy_data();
-        set_s_tensors_by_name(&this->tensors_by_name);
     }
 
     return true;
