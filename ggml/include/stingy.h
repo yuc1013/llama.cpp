@@ -13,6 +13,8 @@
     #define STINGY_API
 #endif
 
+#define STINGY
+
 #ifdef __cplusplus
 extern "C" {
 #endif

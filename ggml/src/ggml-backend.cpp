@@ -27,6 +27,9 @@
 #include <sys/sysctl.h>
 #endif
 
+// stingy: load fewer than need
+#include "stingy.h"
+
 // backend buffer type
 
 const char * ggml_backend_buft_name(ggml_backend_buffer_type_t buft) {
@@ -790,7 +793,7 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
     return -1;
 }
 
-#if 1
+#if 0 || defined(STINGY)
 #define GGML_SCHED_MAX_SPLITS_DEBUG 4096
 static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML_SCHED_MAX_SPLIT_INPUTS][128]; // debug only
 #define SET_CAUSE(node, ...) sprintf(causes[hash_id(node)], __VA_ARGS__)
@@ -937,7 +940,6 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 // stingy: load fewer than need
-#include "stingy.h"
 #include <unordered_map>
 
 extern int s_use_stingy;
@@ -979,14 +981,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             *leaf_backend_id = ggml_backend_sched_backend_id_from_cur(sched, leaf);
         }
         // stingy: alloc B to gpu temporarily
-        if (use_stingy()) {
+        if (false && use_stingy()) {
             int bid = blk_id(leaf->name);
             if (bid < s_n_B_start || bid >= s_n_C_start) {
                 continue;
             }
             *leaf_backend_id = 0; // gpu
-            GGML_LOG_DEBUG("leaf #%d (%s): assigned backend %d [%s]\n", i, leaf->name, *leaf_backend_id,
-                *leaf_backend_id != -1 ? ggml_backend_name(sched->backends[*leaf_backend_id]) : "NULL");
+            // GGML_LOG_DEBUG("leaf #%d (%s): assigned backend %d [%s]\n", i, leaf->name, *leaf_backend_id,
+            //     *leaf_backend_id != -1 ? ggml_backend_name(sched->backends[*leaf_backend_id]) : "NULL");
         }
     }
 
@@ -996,7 +998,25 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         // do not overwrite user assignments
         if (*node_backend_id == -1) {
             *node_backend_id = ggml_backend_sched_backend_id_from_cur(sched, node);
-
+            // stingy: avoid weight-caused cpu assignment
+            if (use_stingy() && s_tensors_by_name != nullptr) {
+                char * cause = causes[hash_id(node)];
+                int src_idx = -1;
+                if (sscanf(cause, "1.wgt%d", &src_idx) != 1) {
+                    // not assigned due to weight, skip
+                    continue;
+                }
+                if (src_idx < 0 && src_idx >= GGML_MAX_SRC) {
+                    // invalid src idx, skip
+                    continue;
+                }
+                int bid = blk_id(node->src[src_idx]->name);
+                if (bid < s_n_B_start || bid >= s_n_C_start) {
+                    // not in B range, skip
+                    continue;
+                }
+                *node_backend_id = -1; // unassign to allow assignment based on other sources or users
+            }
 #if 0
             // src
             if (node->op == GGML_OP_NONE) {
@@ -1015,6 +1035,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
 #endif
         }
+        GGML_LOG_DEBUG("node #%d (%s): assigned backend %d [%s] cause: %s\n", i, node->name, *node_backend_id,
+            *node_backend_id != -1 ? ggml_backend_name(sched->backends[*node_backend_id]) : "NULL", GET_CAUSE(node));
     }
 
     // pass 2: expand current backend assignments
@@ -1159,7 +1181,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     // stingy: move B back
-    if (use_stingy()) {
+    if (false && use_stingy()) {
         for (int i = 0; i < graph->n_leafs; i++) {
             struct ggml_tensor * leaf = graph->leafs[i];
             int * leaf_backend_id = &tensor_backend_id(leaf);
@@ -1169,8 +1191,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 continue;
             }
             *leaf_backend_id = ggml_backend_sched_backend_id_from_cur(sched, leaf);
-            GGML_LOG_DEBUG("leaf #%d (%s): assigned backend %d [%s]\n", i, leaf->name, *leaf_backend_id,
-                *leaf_backend_id != -1 ? ggml_backend_name(sched->backends[*leaf_backend_id]) : "NULL");
         }
     }
 
@@ -1205,6 +1225,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         GGML_ASSERT(*cur_backend_id != -1);
     }
+
+
 
     // pass 5: split graph, find tensors that need to be copied
     {
@@ -1339,7 +1361,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->n_splits = i_split + 1;
     }
 
-    if (sched->debug) {
+    if (true || sched->debug) {
         ggml_backend_sched_print_assignments(sched, graph);
     }
 
@@ -1451,13 +1473,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
         // stingy: split internal build
         for (int j = split->i_start; j < split->i_end; j++) {
-            if (use_stingy() && s_tensors_by_name != nullptr) {
-                struct ggml_tensor * node = graph->nodes[j];
-                int bid = blk_id(node->name);
-                if (bid >= s_n_B_start && bid < s_n_C_start) {
+            // if (use_stingy() && s_tensors_by_name != nullptr) {
+            //     struct ggml_tensor * node = graph->nodes[j];
+            //     int bid = blk_id(node->name);
+            //     if (bid >= s_n_B_start && bid < s_n_C_start) {
 
-                }
-            }
+            //     }
+            // }
 
             // original logic
             assert(graph_copy->size > graph_copy->n_nodes);
