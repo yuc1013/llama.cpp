@@ -13,6 +13,12 @@
     #define STINGY_API
 #endif
 
+const int DISABLE = 0;
+const int MODEA = 1;
+const int MODEB = 2;
+
+const int MODE = MODEB;
+
 #define STINGY
 
 #ifdef __cplusplus

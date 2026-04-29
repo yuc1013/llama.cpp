@@ -999,7 +999,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         if (*node_backend_id == -1) {
             *node_backend_id = ggml_backend_sched_backend_id_from_cur(sched, node);
             // stingy: avoid weight-caused cpu assignment
-            if (use_stingy() && s_tensors_by_name != nullptr) {
+            if (MODE == MODEB && use_stingy()) {
                 char * cause = causes[hash_id(node)];
                 int src_idx = -1;
                 if (sscanf(cause, "1.wgt%d", &src_idx) != 1) {
@@ -1035,8 +1035,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
 #endif
         }
-        GGML_LOG_DEBUG("node #%d (%s): assigned backend %d [%s] cause: %s\n", i, node->name, *node_backend_id,
-            *node_backend_id != -1 ? ggml_backend_name(sched->backends[*node_backend_id]) : "NULL", GET_CAUSE(node));
+        // GGML_LOG_DEBUG("node #%d (%s): assigned backend %d [%s] cause: %s\n", i, node->name, *node_backend_id,
+        //     *node_backend_id != -1 ? ggml_backend_name(sched->backends[*node_backend_id]) : "NULL", GET_CAUSE(node));
     }
 
     // pass 2: expand current backend assignments
@@ -1226,7 +1226,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
-
+    // stingy: print all backends
+    if (false && use_stingy()) {
+         for (int i = 0; i < graph->n_nodes; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            int * backend_id = &tensor_backend_id(node);
+            GGML_LOG_DEBUG("node #%d (%s): assigned backend %d [%s] cause: %s\n", i, node->name, *backend_id,
+                *backend_id != -1 ? ggml_backend_name(sched->backends[*backend_id]) : "NULL", GET_CAUSE(node));
+        }
+    }
 
     // pass 5: split graph, find tensors that need to be copied
     {
@@ -1361,7 +1369,55 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->n_splits = i_split + 1;
     }
 
-    if (true || sched->debug) {
+    // stingy: merge splits in the same block
+    if (use_stingy()) {
+        int * split_blks = (int *)malloc(sched->n_splits * sizeof(int));
+
+        for (int i = 0; i < sched->n_splits; i++) {
+            split_blks[i] = -1;
+            for (int j = 0; j < sched->splits[i].n_inputs; j++) {
+                int bid = blk_id(sched->splits[i].inputs[j]->name);
+                // 过滤不在 B 范围内的块
+                if (bid < s_n_B_start || bid >= s_n_C_start) {
+                    continue;
+                }
+                split_blks[i] = bid;
+                break;
+            }
+        }
+
+        for (int i = 1; i < sched->n_splits; i++) {
+            struct ggml_backend_sched_split * split = &sched->splits[i];
+            struct ggml_backend_sched_split * prev_split = &sched->splits[i - 1];
+
+            bool same_block   = (split_blks[i] != -1 && split_blks[i] == split_blks[i - 1]);
+            bool same_backend = (split->backend_id == prev_split->backend_id);
+            bool fit_inputs   = (prev_split->n_inputs + split->n_inputs <= GGML_SCHED_MAX_SPLIT_INPUTS);
+
+            if (same_block && same_backend && fit_inputs) {
+                // 1. 合并索引
+                prev_split->i_end = split->i_end;
+
+                // 2. 移动输入
+                for (int j = 0; j < split->n_inputs; j++) {
+                    prev_split->inputs[prev_split->n_inputs++] = split->inputs[j];
+                }
+
+                // 3. 重要：同步删除已合并的 blk_id 记录
+                int num_to_move = sched->n_splits - i - 1;
+                if (num_to_move > 0) {
+                    memmove(&split_blks[i], &split_blks[i + 1], num_to_move * sizeof(int));
+                    memmove(split, split + 1, num_to_move * sizeof(struct ggml_backend_sched_split));
+                }
+
+                sched->n_splits--;
+                i--; // 回退一步，检查新合并的节点是否还能与更前方的节点合并
+            }
+        }
+        free(split_blks);
+    }
+
+    if (use_stingy() || sched->debug) {
         ggml_backend_sched_print_assignments(sched, graph);
     }
 
@@ -1379,7 +1435,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     int graph_size = std::max(graph->n_nodes, graph->n_leafs) + sched->n_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sched->n_copies;
     
     // stingy: load fewer than need
-    if (use_stingy() && s_tensors_by_name != nullptr) {
+    if (use_stingy()) {
         graph_size += s_nl * 256;
     }
 
