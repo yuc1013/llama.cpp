@@ -28,6 +28,17 @@
 #endif
 
 // stingy: load fewer than need
+#include <unordered_map>
+
+extern int s_use_stingy;
+extern int s_nl;
+extern int s_ngl;
+extern int s_ngls;
+extern int s_n_B_start;
+extern int s_n_C_start;
+
+#include <string>
+extern std::vector<std::pair<std::string, struct ggml_tensor *>> * s_tensors_by_name;
 #include "stingy.h"
 
 // backend buffer type
@@ -405,10 +416,17 @@ void ggml_backend_tensor_copy(struct ggml_tensor * src, struct ggml_tensor * dst
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: warning: slow copy from %s to %s\n", __func__, ggml_backend_buffer_name(src->buffer), ggml_backend_buffer_name(dst->buffer));
 #endif
+                printf("<STINGY>1016\n");
+
         size_t nbytes = ggml_nbytes(src);
+                printf("<STINGY>1017\n");
+
         void * data = malloc(nbytes);
+                printf("<STINGY>1018\n");
         ggml_backend_tensor_get(src, data, 0, nbytes);
+                printf("<STINGY>1019\n");
         ggml_backend_tensor_set(dst, data, 0, nbytes);
+                printf("<STINGY>1020\n");
         free(data);
     }
 }
@@ -853,6 +871,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                     }
                 }
             }
+
+            // stingy: avoid cpu assignment because B
+            if (use_stingy()) {
+                GGML_ASSERT(src->name != NULL);
+                int bid = blk_id(src->name);
+                if (bid >= s_n_B_start && bid < s_n_C_start) {
+                    SET_CAUSE(tensor, "1.stingy");
+                    return -1;
+                }
+            }
+
             SET_CAUSE(tensor, "1.wgt%d", i);
             return src_backend_id;
         }
@@ -939,19 +968,6 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
-// stingy: load fewer than need
-#include <unordered_map>
-
-extern int s_use_stingy;
-extern int s_nl;
-extern int s_ngl;
-extern int s_ngls;
-extern int s_n_B_start;
-extern int s_n_C_start;
-
-#include <string>
-extern std::vector<std::pair<std::string, struct ggml_tensor *>> * s_tensors_by_name;
-
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
@@ -998,25 +1014,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         // do not overwrite user assignments
         if (*node_backend_id == -1) {
             *node_backend_id = ggml_backend_sched_backend_id_from_cur(sched, node);
-            // stingy: avoid weight-caused cpu assignment
-            if (MODE == MODEB && use_stingy()) {
-                char * cause = causes[hash_id(node)];
-                int src_idx = -1;
-                if (sscanf(cause, "1.wgt%d", &src_idx) != 1) {
-                    // not assigned due to weight, skip
-                    continue;
-                }
-                if (src_idx < 0 && src_idx >= GGML_MAX_SRC) {
-                    // invalid src idx, skip
-                    continue;
-                }
-                int bid = blk_id(node->src[src_idx]->name);
-                if (bid < s_n_B_start || bid >= s_n_C_start) {
-                    // not in B range, skip
-                    continue;
-                }
-                *node_backend_id = -1; // unassign to allow assignment based on other sources or users
-            }
 #if 0
             // src
             if (node->op == GGML_OP_NONE) {
@@ -1035,8 +1032,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
 #endif
         }
-        // GGML_LOG_DEBUG("node #%d (%s): assigned backend %d [%s] cause: %s\n", i, node->name, *node_backend_id,
-        //     *node_backend_id != -1 ? ggml_backend_name(sched->backends[*node_backend_id]) : "NULL", GET_CAUSE(node));
     }
 
     // pass 2: expand current backend assignments
@@ -1370,7 +1365,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     // stingy: merge splits in the same block
-    if (use_stingy()) {
+    if (false && MODE == MODEB && use_stingy()) {
         int * split_blks = (int *)malloc(sched->n_splits * sizeof(int));
 
         for (int i = 0; i < sched->n_splits; i++) {
@@ -1417,7 +1412,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         free(split_blks);
     }
 
-    if (use_stingy() || sched->debug) {
+    if (false && use_stingy() || sched->debug) {
         ggml_backend_sched_print_assignments(sched, graph);
     }
 
@@ -1527,8 +1522,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
         }
 
-        // stingy: split internal build
         for (int j = split->i_start; j < split->i_end; j++) {
+            // stingy: split internal build
             // if (use_stingy() && s_tensors_by_name != nullptr) {
             //     struct ggml_tensor * node = graph->nodes[j];
             //     int bid = blk_id(node->name);
